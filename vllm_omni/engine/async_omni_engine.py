@@ -19,7 +19,6 @@ import time
 import uuid
 import weakref
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
@@ -36,8 +35,7 @@ from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
 )
-from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
-from vllm_omni.diffusion.diffusion_engine import supports_audio_output
+from vllm_omni.diffusion.data import parse_attention_config
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
     SHUTDOWN_JOIN_TIMEOUT_S,
@@ -1231,6 +1229,10 @@ class AsyncOmniEngine:
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
         )
+        config_path = resolved.config_path
+        stage_configs = list(resolved.stage_configs)
+        strategy_lb_policy = resolved.omni_lb_policy
+        self.endpoint_restrictions = resolved.endpoint_restrictions
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an orchestrator-level knob (read once at construction), so apply it here
