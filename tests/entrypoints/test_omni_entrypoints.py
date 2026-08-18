@@ -17,7 +17,7 @@ from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
 from vllm_omni.errors import (
     OmniClientError,
     client_error_from_metadata,
@@ -188,12 +188,28 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
 
 
 def _make_base():
-    from vllm_omni.entrypoints.omni_base import OmniBase
-
     obj = object.__new__(OmniBase)
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_resolve_sampling_params_list_preserves_stage_constraints():
+    base = _make_base()
+    base.engine.num_stages = 1
+    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    base.sampling_constraints_list = [{"detokenize": False, "stop_token_ids": [42]}]
+    caller_params = SamplingParams(seed=1234, max_tokens=7)
+
+    resolved = base.resolve_sampling_params_list(caller_params)
+
+    assert resolved[0] is not caller_params
+    assert resolved[0].seed == 1234
+    assert resolved[0].max_tokens == 7
+    assert resolved[0].detokenize is False
+    assert resolved[0].stop_token_ids == [42]
+    assert caller_params.detokenize is True
+    assert caller_params.stop_token_ids == []
 
 
 def _stage_spec(

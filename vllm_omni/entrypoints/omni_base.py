@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import copy
 import os
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
@@ -214,6 +215,19 @@ class OmniBase(PDDisaggregationMixin):
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
+        self.sampling_constraints_list = [
+            dict(constraints)
+            if isinstance(
+                constraints := getattr(
+                    getattr(stage_config, "stage_pipeline_config", stage_config), "sampling_constraints", {}
+                ),
+                Mapping,
+            )
+            else {}
+            for stage_config in self.engine.stage_configs
+        ]
+        if len(self.sampling_constraints_list) != self.engine.num_stages:
+            self.sampling_constraints_list = [{} for _ in range(self.engine.num_stages)]
         if not self.output_modalities:
             self.output_modalities = [
                 self.engine.get_stage_metadata(i).final_output_type for i in range(self.engine.num_stages)
@@ -316,6 +330,7 @@ class OmniBase(PDDisaggregationMixin):
         sampling_params_list: Sequence[Any] | Any | None,
         allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
+        """Resolve request sampling parameters without dropping stage constraints."""
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
             # Set the output kind to delta since no params were specified
@@ -330,7 +345,25 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got a single sampling params object")
         if len(normalized) != self.num_stages:
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
+
+        if sampling_params_list is not None:
+            normalized = [
+                self._apply_sampling_constraints(params, constraints)
+                for params, constraints in zip(normalized, self.sampling_constraints_list, strict=True)
+            ]
         return normalized
+
+    @staticmethod
+    def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
+        """Apply pipeline-required sampling settings without mutating caller input."""
+        if not constraints:
+            return params
+        if isinstance(params, Mapping):
+            return {**params, **constraints}
+        constrained_params = copy.copy(params)
+        for name, value in constraints.items():
+            setattr(constrained_params, name, value)
+        return constrained_params
 
     def _fire_failure_counter_if_alive(self, request_id: str) -> None:
         """Fire the abort/exception bucket of requests_success_total.

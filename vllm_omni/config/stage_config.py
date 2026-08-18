@@ -947,6 +947,7 @@ def merge_pipeline_deploy(
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
+                sampling_constraints=dict(ps.sampling_constraints),
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,
@@ -974,6 +975,7 @@ class StageConfig:
     scheduler_cls: str | None = None
     hf_config_name: str | None = None
     is_comprehension: bool = False
+    sampling_constraints: dict[str, Any] = field(default_factory=dict)
     yaml_engine_args: dict[str, Any] = field(default_factory=dict)
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
