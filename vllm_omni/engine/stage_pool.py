@@ -1173,6 +1173,16 @@ class StagePool:
             return None
         return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
 
+    def poll_diffusion_scheduler_stats(self, replica_id: int) -> tuple[int, int] | None:
+        """Return the latest (waiting, running) diffusion scheduler snapshot."""
+        if not self.is_replica_available(replica_id):
+            return None
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        get_stats = getattr(raw_client, "get_scheduler_stats", None)
+        return get_stats() if get_stats is not None else None
+
     # ---- Stage-local control plane ----
 
     async def abort_requests(self, request_ids: list[str]) -> None:

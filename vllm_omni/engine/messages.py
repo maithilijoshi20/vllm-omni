@@ -107,6 +107,16 @@ class StageMetricsMessage(EngineQueueMessage, kw_only=True):
     stage_submit_ts: float | None = None
 
 
+class DiffusionQueueStatsMessage(EngineQueueMessage, kw_only=True):
+    """Latest scheduler occupancy reported by a diffusion stage replica."""
+
+    type: Literal["diffusion_queue_stats"] = "diffusion_queue_stats"
+    stage_id: int
+    replica_id: int
+    waiting: int
+    running: int
+
+
 class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc_result"] = "collective_rpc_result"
     rpc_id: str

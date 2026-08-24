@@ -331,6 +331,31 @@ class StageDiffusionProc:
         fatal_event = asyncio.Event()
         self._fatal_event = fatal_event
 
+        async def _report_scheduler_stats() -> None:
+            """Push scheduler occupancy whenever it changes.
+
+            The worker thread owns scheduling, so the subprocess event loop
+            polls under the engine condition lock rather than trying to emit
+            ZMQ frames from that thread.
+            """
+            last_stats: tuple[int, int] | None = None
+            while True:
+                engine = self._engine
+                if engine is not None:
+                    with engine._cv:
+                        stats = (
+                            engine.scheduler.num_waiting_requests(),
+                            engine.scheduler.num_running_requests(),
+                        )
+                    if stats != last_stats:
+                        await response_socket.send(
+                            encoder.encode({"type": "queue_stats", "waiting": stats[0], "running": stats[1]})
+                        )
+                        last_stats = stats
+                await asyncio.sleep(0.01)
+
+        scheduler_stats_task = asyncio.create_task(_report_scheduler_stats())
+
         async def _dispatch_request(
             request_id: str,
             prompt: Any,
@@ -487,6 +512,8 @@ class StageDiffusionProc:
             if tasks:
                 await asyncio.gather(*tasks.values(), return_exceptions=True)
 
+            scheduler_stats_task.cancel()
+            await asyncio.gather(scheduler_stats_task, return_exceptions=True)
             self._active_tasks = None
             self._fatal_event = None
             request_socket.close()

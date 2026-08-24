@@ -240,6 +240,8 @@ class StageDiffusionClient(StageClientBase):
 
             if msg_type == "result":
                 self._output_queue.put_nowait(msg["output"])
+            elif msg_type == "queue_stats":
+                self._scheduler_stats = (int(msg["waiting"]), int(msg["running"]))
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "error":
@@ -384,6 +386,11 @@ class StageDiffusionClient(StageClientBase):
                     return None
                 raise EngineDeadError(f"StageDiffusionProc died unexpectedly (exit code {exitcode})")
             return None
+
+    def get_scheduler_stats(self) -> tuple[int, int] | None:
+        """Return the latest scheduler (waiting, running) snapshot."""
+        self._drain_responses()
+        return getattr(self, "_scheduler_stats", None)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         self._request_socket.send(

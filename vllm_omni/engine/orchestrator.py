@@ -40,6 +40,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     EngineQueueMessage,
+    DiffusionQueueStatsMessage,
     ErrorMessage,
     InteractionMessage,
     OutputMessage,
@@ -950,6 +951,18 @@ class Orchestrator:
                     # evicted rather than tearing down every stage (#4285).
                     try:
                         if pool.stage_type == "diffusion":
+                            queue_stats = pool.poll_diffusion_scheduler_stats(replica_id)
+                            if queue_stats is not None:
+                                waiting, running = queue_stats
+                                await self.output_async_queue.put(
+                                    DiffusionQueueStatsMessage(
+                                        stage_id=stage_id,
+                                        replica_id=replica_id,
+                                        waiting=waiting,
+                                        running=running,
+                                    )
+                                )
+                                idle = False
                             diffusion_output = pool.poll_diffusion_output(replica_id)
                             if diffusion_output is None:
                                 continue

@@ -20,6 +20,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     OutputMessage,
+    DiffusionQueueStatsMessage,
     StageMetricsMessage,
 )
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -221,6 +222,7 @@ class OmniBase(PDDisaggregationMixin):
 
         self.request_states: dict[str, ClientRequestState] = {}
         self._consumed_metric_messages: dict[str, set[int]] = {}
+        self._diffusion_queue_stats: dict[tuple[int, int], tuple[int, int]] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
@@ -466,12 +468,31 @@ class OmniBase(PDDisaggregationMixin):
             req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
         req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
 
+    def _process_diffusion_queue_stats_message(self, msg: DiffusionQueueStatsMessage) -> None:
+        """Publish pipeline gauges using queue depth reported by diffusion schedulers."""
+        snapshots = getattr(self, "_diffusion_queue_stats", None)
+        if snapshots is None:
+            snapshots = self._diffusion_queue_stats = {}
+        snapshots[(msg.stage_id, msg.replica_id)] = (msg.waiting, msg.running)
+
+        total = len(self.request_states)
+        # A request handed to a diffusion replica is not running until that
+        # replica's scheduler admits it. Keep the global invariant intact by
+        # subtracting the scheduler-owned waiting backlog from pipeline total.
+        waiting = min(total, sum(snapshot[0] for snapshot in snapshots.values()))
+        self.prom_metrics.set_waiting(waiting)
+        self.prom_metrics.set_running(total - waiting)
+
     def _handle_output_message(
         self,
         msg: EngineQueueMessage | None,
     ) -> OutputMessageHandleResult:
         """Handle one Orchestrator output-queue message."""
         if msg is None:
+            return True, None, None, None
+
+        if isinstance(msg, DiffusionQueueStatsMessage):
+            self._process_diffusion_queue_stats_message(msg)
             return True, None, None, None
 
         if isinstance(msg, StageMetricsMessage):
