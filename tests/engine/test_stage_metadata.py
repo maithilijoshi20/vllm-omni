@@ -213,3 +213,37 @@ def test_runtime_planning_retains_typed_stage_configs(mocker):
     assert plans[2].replicas[0].stage_cfg is typed_configs[2]
     assert build_args.call_args_list[0].args[0] is legacy_configs[0]
     assert build_args.call_args_list[1].args[0] is legacy_configs[1]
+
+
+@pytest.mark.parametrize(
+    ("typed_configs", "legacy_configs", "error"),
+    [
+        (lambda configs: configs[:-1], lambda configs: configs, "same number of stages"),
+        (lambda configs: list(reversed(configs)), lambda configs: configs, "same stage ID"),
+    ],
+)
+def test_runtime_planning_rejects_unpaired_typed_and_legacy_configs(
+    typed_configs,
+    legacy_configs,
+    error,
+):
+    from vllm_omni.engine.stage_runtime import StageRuntime
+
+    pipeline, deploy = _metadata_inputs()
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+    )
+    typed = typed_configs(list(omni_config.stage_configs))
+    legacy = legacy_configs([stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)])
+
+    with pytest.raises(ValueError, match=error):
+        StageRuntime(
+            stage_configs=legacy,
+            typed_stage_configs=typed,
+            model="test-model",
+            config_path="test-deploy.yaml",
+            stage_init_timeout=30,
+            diffusion_batch_size=1,
+            async_chunk=False,
+        )

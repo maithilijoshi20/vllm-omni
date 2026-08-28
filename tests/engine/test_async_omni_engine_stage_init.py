@@ -25,6 +25,33 @@ from vllm_omni.engine.stage_runtime import StageRuntime
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_resolve_stage_configs_retains_typed_configs_for_runtime_planning(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._omni_lb_policy = "random"
+    legacy_configs = [types.SimpleNamespace(stage_id=0)]
+    typed_configs = [types.SimpleNamespace(stage_id=0)]
+    resolved = types.SimpleNamespace(
+        config_path="deploy.yaml",
+        stage_configs=tuple(legacy_configs),
+        omni_config=types.SimpleNamespace(stage_configs=tuple(typed_configs)),
+        omni_lb_policy=None,
+        endpoint_restrictions=None,
+        pipeline_config=None,
+    )
+    monkeypatch.setattr(async_omni_engine_module, "resolve_omni_config", lambda *args, **kwargs: resolved)
+
+    config_path, stage_configs = engine._resolve_stage_configs(
+        model="test-model",
+        kwargs={},
+        trust_remote_code=False,
+    )
+
+    assert config_path == "deploy.yaml"
+    assert stage_configs == legacy_configs
+    assert engine._typed_stage_configs == typed_configs
+    assert engine._typed_stage_configs is not typed_configs
+
+
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
     engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)
@@ -192,6 +219,8 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
 
     engine = object.__new__(AsyncOmniEngine)
     engine.stage_configs = [types.SimpleNamespace()]
+    typed_stage_configs = [types.SimpleNamespace(stage_id=0)]
+    engine._typed_stage_configs = typed_stage_configs
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -220,6 +249,8 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
 
     assert captured["stage_init_timeout"] == 7
     assert captured["log_stats"] is True
+
+    assert captured["typed_stage_configs"] is typed_stage_configs
 
 
 def test_compute_replica_layout_splits_diffusion_devices_by_world_size():

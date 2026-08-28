@@ -132,6 +132,22 @@ class StageRuntime:
         tokenizer: str | None = None,
         log_stats: bool = False,
     ) -> None:
+        if typed_stage_configs is not None:
+            if len(typed_stage_configs) != len(stage_configs):
+                raise ValueError(
+                    "Typed and legacy stage configs must contain the same number of stages "
+                    f"(got {len(typed_stage_configs)} typed and {len(stage_configs)} legacy)."
+                )
+            for stage_idx, (typed_stage_cfg, legacy_stage_cfg) in enumerate(
+                zip(typed_stage_configs, stage_configs, strict=True)
+            ):
+                typed_stage_id = int(typed_stage_cfg.stage_id)
+                legacy_stage_id = int(getattr(legacy_stage_cfg, "stage_id", stage_idx))
+                if typed_stage_id != legacy_stage_id:
+                    raise ValueError(
+                        "Typed and legacy stage configs must be ordered by the same stage ID "
+                        f"(index {stage_idx}: {typed_stage_id} != {legacy_stage_id})."
+                    )
         self._stage_configs = stage_configs
         self._typed_stage_configs = typed_stage_configs
         self._planning_stage_configs = typed_stage_configs if typed_stage_configs is not None else stage_configs

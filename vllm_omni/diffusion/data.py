@@ -89,18 +89,15 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
-<<<<<<< HEAD
     diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
     fastvideo_vsa_topk = normalized.pop("fastvideo_vsa_topk", None)
     if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
         existing = normalized.get("diffusion_attention_config")
         normalized["diffusion_attention_config"] = parse_attention_config(
-=======
     diffusion_attn_backend = config_kwargs.pop("diffusion_attention_backend", None)
     if diffusion_attn_backend is not None:
         existing = config_kwargs.get("diffusion_attention_config")
         config_kwargs["diffusion_attention_config"] = parse_attention_config(
->>>>>>> 6584aa9cd ([Refactor] Clarify diffusion config kwargs naming)
             existing,
             attention_backend=diffusion_attn_backend,
             fastvideo_vsa_topk=fastvideo_vsa_topk,

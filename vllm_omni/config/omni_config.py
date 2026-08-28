@@ -753,7 +753,6 @@ class _DiffusionConfigProjection:
         config_kwargs = normalize_omni_diffusion_kwargs(kwargs)
         valid_fields = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in config_kwargs.items() if k in valid_fields})
->>>>>>> 6584aa9cd ([Refactor] Clarify diffusion config kwargs naming)
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
