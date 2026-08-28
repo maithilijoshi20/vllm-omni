@@ -90,11 +90,13 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
     diffusion_attn_backend = config_kwargs.pop("diffusion_attention_backend", None)
-    if diffusion_attn_backend is not None:
+    fastvideo_vsa_topk = config_kwargs.pop("fastvideo_vsa_topk", None)
+    if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
         existing = config_kwargs.get("diffusion_attention_config")
         config_kwargs["diffusion_attention_config"] = parse_attention_config(
             existing,
             attention_backend=diffusion_attn_backend,
+            fastvideo_vsa_topk=fastvideo_vsa_topk,
         )
 
     # Check environment variable as fallback for cache_backend.
@@ -121,6 +123,30 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
             config_kwargs[key] = {}
 
     return config_kwargs
+
+
+def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
+    """Validate HWR policy without accessing its configured storage domain."""
+    if mode not in {"disabled", "preferred", "required"}:
+        raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
+    if mode != "disabled" and (not isinstance(root, str) or not root.strip()):
+        raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+
+
+def validate_dlo_host_registration_options(
+    *,
+    limit_gib: object,
+    enable_dlo: bool,
+    use_allgather: bool,
+    hwr_mode: object,
+) -> float:
+    """Validate optional DLO transport budget without probing CUDA or HWR."""
+    value = float(limit_gib)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
+    if value and (not enable_dlo or use_allgather or hwr_mode == "disabled"):
+        raise ValueError("dlo_host_registration_limit_gib requires enabled no-AllGather DLO and Host Weight Runtime")
+    return value
 
 
 def parse_kv_cache_skip_selector(
@@ -755,6 +781,7 @@ class OmniDiffusionConfig:
     engine_backend: str | type = "default"
 
     # Local Diffusion KV ownership and cache-layout mode.
+    diffusion_kv_max_rows_per_request: int | None = None
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
 
     # Optional override for the diffusion model runner class (import path).
@@ -1032,6 +1059,16 @@ class OmniDiffusionConfig:
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.diffusion_kv_max_rows_per_request is not None and (
+            type(self.diffusion_kv_max_rows_per_request) is not int
+            or self.diffusion_kv_max_rows_per_request <= 0
+        ):
+            raise ValueError("diffusion_kv_max_rows_per_request must be a positive integer when set")
+        if (
+            self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and self.diffusion_kv_max_rows_per_request is None
+        ):
+            raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
         if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
             raise ValueError("kv_cache_memory_bytes must be non-negative")
         if not 0.0 < self.gpu_memory_utilization <= 1.0:
@@ -1660,6 +1697,7 @@ class AttentionSpec:
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
     block_sparse: BlockSparseSpec | None = None
+    fastvideo_vsa_topk: int | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1833,6 +1871,7 @@ def parse_attention_config(
     attention_config: AttentionConfig | Mapping[str, Any] | None = None,
     *,
     attention_backend: str | None = None,
+    fastvideo_vsa_topk: int | None = None,
 ) -> AttentionConfig:
     """Pure type-conversion: coerce *attention_config* to an AttentionConfig.
 
@@ -1858,7 +1897,9 @@ def parse_attention_config(
                 "--diffusion-attention-backend is mutually exclusive with --diffusion-attention-config.default.backend."
             )
         if attention_backend.lower() != "auto":
-            normalized.default = AttentionSpec(backend=attention_backend)
+            normalized.default = AttentionSpec(
+                backend=attention_backend, fastvideo_vsa_topk=fastvideo_vsa_topk
+            )
 
     return normalized
 
