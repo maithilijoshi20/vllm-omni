@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E501
 from collections.abc import Generator
 
@@ -7,9 +10,14 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
+from vllm_omni.config.omni_config import (
+    VllmOmniARStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -18,7 +26,10 @@ MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
 DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+pytestmark = [
+    pytest.mark.advanced_model,
+    pytest.mark.diffusion,
+]
 
 # System prompt type. Options: None, dynamic, en_vanilla, en_recaption, en_think_recaption, en_unified
 # Below are the CLIP embedding tensors from the official HunyuanImage model (seed=1234, prompt: "A brown and white dog is running on the grass").
@@ -278,6 +289,28 @@ def omni() -> Generator[Omni, None, None]:
         trust_remote_code=True,
     ) as runner:
         yield runner.omni
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
+@hardware_test(res={"cuda": "H100"}, num_cards=8)
+def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
+    """Resolved AR and diffusion configs remain typed through startup."""
+    stage_configs = omni.engine.stage_configs
+    assert len(stage_configs) == 2
+    ar_stage, diffusion_stage = stage_configs
+
+    assert isinstance(ar_stage, VllmOmniARStageConfig)
+    assert ar_stage.stage_id == 0
+    assert ar_stage.model_stage == "AR"
+    assert ar_stage.model_config.enforce_eager is True
+    assert ar_stage.final_output_type == "text"
+
+    assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
+    assert diffusion_stage.stage_id == 1
+    assert diffusion_stage.model_stage == "dit"
+    assert diffusion_stage.model_config.enforce_eager is True
+    assert diffusion_stage.final_output_type == "image"
+    assert diffusion_stage.input_sources == [0]
 
 
 def _extract_generated_image(outputs: list[object]) -> Image.Image:

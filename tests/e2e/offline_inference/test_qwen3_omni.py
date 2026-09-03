@@ -17,6 +17,10 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_video
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.config.omni_config import (
+    VllmOmniARStageConfig,
+    VllmOmniGenerationStageConfig,
+)
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -57,6 +61,28 @@ def get_question(prompt_type="video"):
         "video": "Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["video"])
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_structured_multistage_config_reaches_runtime(omni_runner) -> None:
+    """Deploy-resolved typed stages remain intact through engine startup."""
+    stage_configs = omni_runner.omni.engine.stage_configs
+    assert len(stage_configs) == 3
+    thinker, talker, code2wav = stage_configs
+
+    assert isinstance(thinker, VllmOmniARStageConfig)
+    assert isinstance(talker, VllmOmniARStageConfig)
+    assert isinstance(code2wav, VllmOmniGenerationStageConfig)
+    assert [stage.stage_id for stage in stage_configs] == [0, 1, 2]
+    assert [stage.model_stage for stage in stage_configs] == ["thinker", "talker", "code2wav"]
+    assert code2wav.final_output_type == "audio"
+
+    if current_omni_platform.is_cuda():
+        assert thinker.model_config.enforce_eager is True
+        assert talker.model_config.enforce_eager is True
 
 
 @pytest.mark.advanced_model
