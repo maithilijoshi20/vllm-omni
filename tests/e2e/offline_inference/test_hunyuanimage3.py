@@ -294,23 +294,49 @@ def omni() -> Generator[Omni, None, None]:
 @pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
 @hardware_test(res={"cuda": "H100"}, num_cards=8)
 def test_structured_mixed_pipeline_config_reaches_runtime(omni: Omni) -> None:
-    """Resolved AR and diffusion configs remain typed through startup."""
+    """Mixed-pipeline deploy settings affect the live structured stages."""
     stage_configs = omni.engine.stage_configs
     assert len(stage_configs) == 2
     ar_stage, diffusion_stage = stage_configs
-
     assert isinstance(ar_stage, VllmOmniARStageConfig)
     assert ar_stage.stage_id == 0
     assert ar_stage.model_stage == "AR"
     assert ar_stage.model_config.enforce_eager is True
     assert ar_stage.final_output_type == "text"
-
+    assert ar_stage.runtime_config.devices == "0,1"
+    assert ar_stage.parallel_config.tensor_parallel_size == 2
+    assert ar_stage.scheduler_config.max_num_seqs == 1
+    assert ar_stage.scheduler_config.max_num_batched_tokens == 32768
+    assert ar_stage.cache_config.gpu_memory_utilization == 0.95
+    assert ar_stage.model_config.default_sampling_params == {
+        "temperature": 0.0,
+        "top_p": 1,
+        "top_k": -1,
+        "max_tokens": 8192,
+        "detokenize": True,
+        "skip_special_tokens": False,
+        "include_stop_str_in_output": True,
+    }
+    assert ar_stage.connector_config.omni_kv_config["need_send_cache"] is True
+    assert ar_stage.connector_config.output_connectors == {"to_stage_1": "rdma_connector"}
     assert isinstance(diffusion_stage, VllmOmniDiffusionStageConfig)
     assert diffusion_stage.stage_id == 1
     assert diffusion_stage.model_stage == "dit"
     assert diffusion_stage.model_config.enforce_eager is True
     assert diffusion_stage.final_output_type == "image"
     assert diffusion_stage.input_sources == [0]
+    assert diffusion_stage.runtime_config.devices == "2,3"
+    assert diffusion_stage.runtime_config.distributed_executor_backend == "mp"
+    assert diffusion_stage.parallel_config.tensor_parallel_size == 2
+    assert diffusion_stage.parallel_config.enable_expert_parallel is True
+    assert diffusion_stage.scheduler_config.max_num_seqs == 1
+    assert diffusion_stage.model_config.default_sampling_params == {"num_inference_steps": 50, "guidance_scale": 0}
+    assert diffusion_stage.connector_config.omni_kv_config == {
+        "need_recv_cache": True,
+        "enable_kv_async_prefetch": True,
+        "kv_prefetch_min_free_mem_ratio": 0.2,
+    }
+    assert diffusion_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
 
 
 def _extract_generated_image(outputs: list[object]) -> Image.Image:
