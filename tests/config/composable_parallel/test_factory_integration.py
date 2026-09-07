@@ -152,3 +152,17 @@ def test_typed_cli_overrides_strategy():
     talker = next(stage for stage in config.stage_configs if stage.model_stage == "talker")
     assert talker.runtime_config.num_replicas == 3
     assert config.orchestrator_config.omni_lb_policy == "round-robin"
+    assert config.strategy_omni_lb_policy == "round-robin"
+
+
+def test_typed_tp_only_strategy_has_no_derived_lb_policy():
+    pipeline = OMNI_PIPELINES["qwen2_5_omni"]
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=load_deploy_config(_DEPLOY),
+        cli_overrides={"omni_lb_policy": "round-robin"},
+        strategy_specs={"thinker": [_tp(1)]},
+    )
+
+    assert config.orchestrator_config.omni_lb_policy == "round-robin"
+    assert config.strategy_omni_lb_policy is None

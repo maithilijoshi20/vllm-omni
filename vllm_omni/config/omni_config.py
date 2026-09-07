@@ -1875,6 +1875,10 @@ class VllmOmniConfig:
     pipeline_config: PipelineConfig
     stage_configs: tuple[StageConfigType, ...]
     orchestrator_config: VllmOmniOrchestratorConfig = field(default_factory=VllmOmniOrchestratorConfig)
+    # Keep strategy provenance separate from the effective orchestrator value:
+    # an explicit CLI policy may be present even when the strategy declares no
+    # stage-replica axis.
+    strategy_omni_lb_policy: str | None = None
 
     def stage_by_id(self, stage_id: int) -> StageConfigType:
         for stage in self.stage_configs:
@@ -2010,6 +2014,7 @@ class VllmOmniConfig:
             pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,
+            strategy_omni_lb_policy=(strategy_result.omni_lb_policy if strategy_result is not None else None),
         )
 
 

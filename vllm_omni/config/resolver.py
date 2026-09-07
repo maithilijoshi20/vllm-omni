@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -147,21 +150,13 @@ def _load_strategy_specs(strategy_config_path: str | None) -> Mapping[Any, Any] 
 
 def _build_registered_resolution(
     structured_config: VllmOmniConfig,
-    *,
-    model: str,
-    cli_overrides: dict[str, Any],
-    trust_remote_code: bool | None,
-    deploy_config_path: str | None,
-    strategy_config_path: str | None,
 ) -> OmniConfigResolution:
     """Return the canonical structured runtime view for a resolved pipeline."""
     return OmniConfigResolution(
         config_path=structured_config.orchestrator_config.deploy_config_path,
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
-        omni_lb_policy=(
-            structured_config.orchestrator_config.omni_lb_policy if strategy_config_path is not None else None
-        ),
+        omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
     )
 
 
@@ -203,14 +198,7 @@ def resolve_omni_config(
         strategy_specs=strategy_specs,
     )
     if structured_config is not None:
-        return _build_registered_resolution(
-            structured_config,
-            model=model,
-            cli_overrides=normalized_overrides,
-            trust_remote_code=trust_remote_code,
-            deploy_config_path=deploy_config_path,
-            strategy_config_path=strategy_config_path,
-        )
+        return _build_registered_resolution(structured_config)
 
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
     if not supported:

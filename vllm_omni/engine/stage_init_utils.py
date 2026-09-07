@@ -717,12 +717,7 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
 def extract_stage_metadata_from_omni_stage_config(
     stage_config: BaseVllmOmniStageConfig,
 ) -> StageMetadata:
-    """Project one typed stage config into metadata for a future cutover.
-
-    This projection is not used by production startup yet. Current replica
-    layout, engine-argument, remote-diffusion, and platform setup paths still
-    require the legacy StageConfig/OmegaConf shape.
-    """
+    """Project one typed stage config into production runtime metadata."""
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
     pooling_config = stage_config.pooling_config
     if stage_type == "llm" and (pooling_config.runner or "").lower() == "pooling":
@@ -1103,14 +1098,31 @@ def _project_omni_stage_engine_args(
         diffusion_stage = cast(VllmOmniDiffusionStageConfig, stage_config)
         engine_args.update(_project_omni_config_fields(diffusion_stage.diffusion_config))
 
+    model_excluded_fields = {
+        "default_sampling_params",
+        "has_sampling_extra_args",
+    }
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus"}
+    if not is_diffusion:
+        # These values configure OmniDiffusionConfig or its worker process;
+        # OmniEngineArgs has no matching fields for LLM stages.
+        model_excluded_fields.update(
+            {
+                "disable_autocast",
+                "enable_multithread_weight_load",
+                "num_weight_load_threads",
+            }
+        )
+        runtime_excluded_fields.add("log_level")
+
     for config, excluded_fields in (
         (
             stage_config.model_config,
-            frozenset({"default_sampling_params", "has_sampling_extra_args"}),
+            frozenset(model_excluded_fields),
         ),
         (
             stage_config.runtime_config,
-            frozenset({"devices", "num_replicas", "env", "num_gpus"}),
+            frozenset(runtime_excluded_fields),
         ),
     ):
         engine_args.update(
@@ -1369,13 +1381,7 @@ def build_engine_args_dict_from_omni_stage_config(
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Project one typed stage config into backend engine arguments.
-
-    This projection is prepared for the RFC #4021 stage-init cutover. Current
-    production startup reaches the legacy implementation through
-    ``build_engine_args_dict`` while strategy and startup-plan inputs still
-    use the legacy representation.
-    """
+    """Project one typed production stage config into backend engine arguments."""
     engine_args_dict = _project_omni_stage_engine_args(stage_config)
     _apply_rocm_attention_backend(engine_args_dict, stage_config.stage_type)
     return _finalize_engine_args_dict(

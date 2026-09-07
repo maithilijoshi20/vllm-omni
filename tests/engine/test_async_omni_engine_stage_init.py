@@ -221,6 +221,49 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     assert captured["log_stats"] is True
 
 
+def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_configs = [types.SimpleNamespace()]
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.single_stage_mode = False
+    engine.async_chunk = False
+    engine.tokenizer = None
+    engine._single_stage_id_filter = None
+    engine._omni_master_address = None
+    engine._omni_master_port = None
+    engine._omni_dp_size_local = 1
+    engine._omni_heartbeat_timeout = 30.0
+    engine._omni_lb_policy = "random"
+    engine.request_queue = types.SimpleNamespace()
+    engine._log_stats = False
+
+    prompt_transform = object()
+    client = types.SimpleNamespace(
+        prompt_transform_func=prompt_transform,
+        prompt_expand_func=None,
+        default_sampling_params=types.SimpleNamespace(),
+        final_output=True,
+        final_output_type="text",
+        stage_type="llm",
+        model_stage="text_encoder",
+        is_comprehension=True,
+    )
+    pool = types.SimpleNamespace(
+        stage_client=client,
+        stage_vllm_config=None,
+        output_processor=None,
+    )
+    runtime = types.SimpleNamespace(stage_pools=[pool], initialize=lambda: None)
+    monkeypatch.setattr(engine_mod, "create_stage_runtime", lambda **_kwargs: runtime)
+
+    engine._initialize_stages(stage_init_timeout=7)
+
+    assert engine.prompt_transform_func is prompt_transform
+
+
 def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
     stage_cfg = types.SimpleNamespace(
         stage_id=0,

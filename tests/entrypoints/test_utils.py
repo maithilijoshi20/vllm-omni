@@ -10,6 +10,14 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.composable_parallel import (
+    Broadcast,
+    FanInByStage,
+    MeshAxisSpec,
+    RouteByStage,
+    StrategySpec,
+    TakeRank,
+)
 from vllm_omni.config.resolver import (
     OmniConfigResolution,
     _convert_dataclasses_to_dict,
@@ -331,6 +339,7 @@ class TestResolveOmniConfig:
             ),
             pipeline_config=SimpleNamespace(endpoint_restrictions=(endpoint_restriction,)),
             stage_configs=(typed_stage,),
+            strategy_omni_lb_policy="round-robin",
         )
         create_structured = mocker.patch(
             "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
@@ -339,7 +348,16 @@ class TestResolveOmniConfig:
         create_legacy = mocker.patch(
             "vllm_omni.config.resolver.StageConfigFactory.create_legacy_stage_configs_from_model",
         )
-        strategy_specs = {"stage_1": {"dp": 3}}
+        strategy_specs = {
+            "stage_1": [
+                StrategySpec(
+                    "stage_replica",
+                    MeshAxisSpec("stage_replica", 2),
+                    RouteByStage("round_robin"),
+                    FanInByStage(),
+                )
+            ]
+        }
         load_strategy = mocker.patch(
             "vllm_omni.config.resolver._load_strategy_specs",
             return_value=strategy_specs,
@@ -375,9 +393,48 @@ class TestResolveOmniConfig:
         apply_strategy.assert_not_called()
         assert resolved.config_path == "/resolved/deploy.yaml"
         assert resolved.pipeline_config is structured_config.pipeline_config
-        assert resolved.omni_lb_policy == "round_robin"
+        assert resolved.omni_lb_policy == "round-robin"
         assert resolved.endpoint_restrictions == (endpoint_restriction,)
         assert resolved.stage_configs == (typed_stage,)
+
+    def test_tp_only_strategy_does_not_report_default_lb_policy_as_derived(self, mocker: MockerFixture):
+        structured_config = SimpleNamespace(
+            orchestrator_config=SimpleNamespace(
+                deploy_config_path="/resolved/deploy.yaml",
+                omni_lb_policy="round-robin",
+            ),
+            pipeline_config=SimpleNamespace(endpoint_restrictions=()),
+            stage_configs=(SimpleNamespace(stage_id=0),),
+            strategy_omni_lb_policy=None,
+        )
+        mocker.patch(
+            "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
+            return_value=structured_config,
+        )
+        mocker.patch(
+            "vllm_omni.config.resolver._load_strategy_specs",
+            return_value={
+                "thinker": [
+                    StrategySpec(
+                        "tp",
+                        MeshAxisSpec("tp", 2),
+                        Broadcast(),
+                        TakeRank(),
+                    )
+                ]
+            },
+        )
+
+        resolved = resolve_omni_config(
+            "dummy-model",
+            trust_remote_code=True,
+            deploy_config_path="deploy.yaml",
+            cli_overrides={"omni_lb_policy": "round-robin"},
+            stage_overrides=None,
+            strategy_config_path="strategy.yaml",
+        )
+
+        assert resolved.omni_lb_policy is None
 
 
 class TestCumulativeStreamingCoercion:

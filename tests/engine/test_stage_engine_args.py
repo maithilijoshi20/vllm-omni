@@ -308,6 +308,21 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
     assert inherited_defaults.isdisjoint(engine_args)
 
 
+def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    assert {
+        "enable_multithread_weight_load",
+        "num_weight_load_threads",
+        "disable_autocast",
+        "log_level",
+    }.isdisjoint(engine_args)
+
+
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
     stage_config = VllmOmniARStageConfig(
         stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
