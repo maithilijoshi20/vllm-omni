@@ -35,7 +35,7 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
-    from vllm.config import ProfilerConfig
+    from vllm.config import KVTransferConfig, ProfilerConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
 # The actual import is deferred to __post_init__ to avoid import order issues
@@ -104,6 +104,11 @@ def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, 
     if "cache_backend" not in config_kwargs:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
         config_kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+    elif config_kwargs["cache_backend"] is None:
+        # Callers (e.g. example CLIs with `default=None`) pass an explicit
+        # None for "no cache"; canonicalize it so every consumer sees the
+        # declared `str` value instead of relying on per-model None handling.
+        config_kwargs["cache_backend"] = "none"
 
     cache_config = config_kwargs.get("cache_config")
     if isinstance(cache_config, str):
@@ -677,10 +682,14 @@ def resolve_model_class_name(
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
-    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, resolve_native_diffusion_model_class
 
     if not model:
         return None
+    native_model_class = resolve_native_diffusion_model_class(model)
+    if native_model_class is not None:
+        return native_model_class
+
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
     # Diffusers models: read _class_name from the pipeline index. Missing
@@ -846,7 +855,12 @@ class OmniDiffusionConfig:
 
     output_type: str = "pil"
 
-    # CPU offload parameters
+    # CPU offload parameters. Keep the public mapping raw so stage configs can
+    # serialize it across processes; __post_init__ validates it once and caches
+    # the internal typed resolution used at runtime.
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases. Some model-specific legacy stage lifecycles are
+    # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
@@ -972,6 +986,9 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+    # Native vLLM KV connector configuration. PR0 only assembles the connector;
+    # the native page data path is owned by the follow-up landing PR.
+    kv_transfer_config: "KVTransferConfig | None" = None
     additional_config: dict[str, Any] = field(default_factory=dict)
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
@@ -1098,6 +1115,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.offloader.config import (
+            OffloadStrategy,
+            materialize_legacy_offload_flags,
+        )
+
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1137,6 +1159,19 @@ class OmniDiffusionConfig:
                 "paged_scheduler Diffusion KV does not support imported AR KV; "
                 "disable need_recv_cache until connector-aware import is implemented"
             )
+
+        if self.kv_transfer_config is not None:
+            from vllm_omni.diffusion.diffusion_kv.kv_connector import parse_kv_transfer_config
+
+            if any(self.omni_kv_config.get(name, False) for name in ("need_send_cache", "need_recv_cache")):
+                raise ValueError(
+                    "native kv_transfer_config cannot be combined with legacy omni_kv_config transfer; "
+                    "configure exactly one KV transfer path"
+                )
+            if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+                raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
+            self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
+
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
@@ -1170,6 +1205,9 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        # Resolve offload only after DP/SP normalization so cached policy
+        # validation observes the actual execution topology.
+        offload_strategy = materialize_legacy_offload_flags(self)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1178,10 +1216,14 @@ class OmniDiffusionConfig:
                 incompatible_features.append("HSDP")
             if self.parallel_config.sequence_parallel_size > 1:
                 incompatible_features.append("sequence parallelism")
-            if self.enable_cpu_offload:
-                incompatible_features.append("CPU offload")
-            if self.enable_layerwise_offload:
-                incompatible_features.append("layerwise offload")
+            if offload_strategy is not OffloadStrategy.NONE:
+                incompatible_features.append(
+                    {
+                        OffloadStrategy.MODEL_LEVEL: "CPU offload",
+                        OffloadStrategy.LAYER_WISE: "layerwise offload",
+                        OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
+                    }[offload_strategy]
+                )
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
@@ -1378,7 +1420,10 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+        from vllm_omni.diffusion.utils.hf_utils import (
+            get_diffusion_model_index,
+            resolve_native_diffusion_model_class,
+        )
 
         assert self.model is not None
         try:
@@ -1444,6 +1489,12 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
+                    native_model_class = resolve_native_diffusion_model_class(self.model)
+                    if native_model_class is not None:
+                        self.model_class_name = native_model_class
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before

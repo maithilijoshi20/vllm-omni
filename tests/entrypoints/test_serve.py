@@ -85,6 +85,37 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
+
+    assert args.ulysses_a2a_permute is True
+    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+
+
+def test_serve_parser_accepts_diffusion_quantization_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    expected = {"transformer": {"method": "torchao_float8_weight_only"}}
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Boogu/Boogu-Image-0.1-Base-fp8",
+            "--omni",
+            "--diffusion-quantization-config",
+            '{"transformer":{"method":"torchao_float8_weight_only"}}',
+        ]
+    )
+
+    assert args.diffusion_quantization_config == expected
+    assert args.get_explicit_kwargs_dict()["diffusion_quantization_config"] == expected
+
+
 def _make_headless_args(*, explicit_keys: frozenset[str] | None = None, **kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

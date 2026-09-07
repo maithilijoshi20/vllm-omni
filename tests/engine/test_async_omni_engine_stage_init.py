@@ -205,6 +205,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine._omni_lb_policy = "random"
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
+    engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
     runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
@@ -239,6 +240,7 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
     engine._omni_lb_policy = "random"
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = False
+    engine._parallel_stage_init = False
 
     prompt_transform = object()
     client = types.SimpleNamespace(
