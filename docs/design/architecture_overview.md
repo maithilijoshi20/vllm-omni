@@ -323,18 +323,24 @@ inputs, fields, and ownership rules are described below.
 ```mermaid
 flowchart TB
     layer1["Layer 1 · Authoring inputs<br/>PipelineConfig + DeployConfig"]
-    layer2["Layer 2 · Resolve once<br/>StageConfigFactory.create_from_model()<br/>VllmOmniConfig.from_pipeline_config()"]
-    layer3["Layer 3 · Transport-safe control plane<br/>VllmOmniConfig"]
+    layer2["Layer 2 · Production resolution boundary<br/>resolve_omni_config()<br/>(StageConfigFactory + VllmOmniConfig internally)"]
+    layer3["Layer 3 · Startup hand-off<br/>OmniConfigResolution<br/>PipelineConfig + typed stage configs"]
     layer4["Layer 4 · Runtime launch planning<br/>StageRuntime"]
     layer5["Layer 5 · Engine materialization<br/>VllmConfig / OmniDiffusionConfig"]
 
     layer1 --> layer2 --> layer3 --> layer4 --> layer5
 ```
 
-The single resolution boundary is implemented by
-`StageConfigFactory.create_from_model()` and
-`VllmOmniConfig.from_pipeline_config()` in
+The production resolution boundary is `resolve_omni_config()` in
 [`vllm_omni/config`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/config).
+It delegates typed construction to `StageConfigFactory.create_from_model()` and
+`VllmOmniConfig.from_pipeline_config()`, then returns an
+`OmniConfigResolution` consumed by both `AsyncOmniEngine` and headless startup.
+This envelope carries the effective `PipelineConfig` alongside typed
+`stage_configs`, which `StageRuntime` consumes directly. Both views describe the
+same resolved topology, including injected stages. Backend arguments are
+projected from these typed stages when each engine is initialized.
+
 The legacy `stage_args` YAML path has been removed. Model topology now resolves
 through `PipelineConfig`, with runtime overrides supplied by `DeployConfig`.
 
@@ -354,9 +360,12 @@ The important ownership rules are:
    deploy-time defaults; it does not redefine the model graph.
 3. CLI and Python overrides are applied at the resolution boundary, with
    per-stage overrides taking precedence over global values where supported.
-4. `StageRuntime` owns launch planning and replica lifecycle. `ReplicaInitPlan`
+4. `OmniConfigResolution` is the sole startup hand-off. Its `pipeline_config`
+   and typed `stage_configs` must describe the same
+   topology.
+5. `StageRuntime` owns launch planning and replica lifecycle. `ReplicaInitPlan`
    is runtime-private state, not a user configuration object.
-5. `VllmConfig` and the enriched `OmniDiffusionConfig` are materialized in the
+6. `VllmConfig` and the enriched `OmniDiffusionConfig` are materialized in the
    process that owns the corresponding engine.
 
 ## Main features

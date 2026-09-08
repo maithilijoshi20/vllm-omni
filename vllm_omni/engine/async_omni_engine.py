@@ -29,9 +29,11 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
+    PipelineConfig,
     load_deploy_config,
 )
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
@@ -78,6 +80,7 @@ from vllm_omni.engine.stage_runtime import (
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
+from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -85,6 +88,27 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+_ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
+
+
+def load_and_resolve_stage_configs(
+    model: str,
+    kwargs: dict[str, Any],
+    *,
+    trust_remote_code: bool | None,
+    deploy_config_path: str | None,
+    stage_overrides: Mapping[str, Mapping[str, Any]] | None,
+    strategy_config_path: str | None,
+) -> OmniConfigResolution:
+    """Compatibility seam delegating to the single config resolver."""
+    return resolve_omni_config(
+        model,
+        trust_remote_code=trust_remote_code,
+        cli_overrides=kwargs,
+        deploy_config_path=deploy_config_path,
+        stage_overrides=stage_overrides,
+        strategy_config_path=strategy_config_path,
+    )
 
 
 class AsyncOmniEngine:
@@ -184,11 +208,28 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
+        # Keep the historical tuple return from _resolve_stage_configs while
+        # retaining the richer resolver result for pipeline-wide settings.
+        # Overrides of that private seam fall back to the factory below.
+        deploy_config_path = kwargs.get("deploy_config")
+        self._config_resolution: OmniConfigResolution | None = None
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+        if self._config_resolution is None:
+            pipeline_config = StageConfigFactory.get_pipeline_config(
+                model=model,
+                trust_remote_code=bool(trust_remote_code),
+                deploy_config_path=deploy_config_path,
+            )
+            self._set_pipeline_runtime_config(pipeline_config, deploy_config_path)
+        else:
+            self._set_pipeline_runtime_config(
+                self._config_resolution.pipeline_config,
+                self._config_resolution.config_path,
+            )
 
         self.num_stages = len(self.stage_configs)
         stage0_connector = getattr(self.stage_configs[0], "connector_config", None) if self.num_stages > 0 else None
@@ -214,6 +255,7 @@ class AsyncOmniEngine:
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
         self._duplex_control_client: DuplexControlClient | None = None
         self._running_counter = OmniRequestCounter()
+        self._engines_waiting_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -374,6 +416,7 @@ class AsyncOmniEngine:
                 pd_config=pd_config,
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
+                engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
@@ -946,6 +989,29 @@ class AsyncOmniEngine:
             )
             self._omni_lb_policy = str(derived)
 
+    @staticmethod
+    def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        """Compatibility seam for the factory-owned diffusion fallback."""
+        return StageConfigFactory.create_default_diffusion(kwargs)
+
+    def _set_pipeline_runtime_config(
+        self,
+        pipeline_config: PipelineConfig | None,
+        config_path: str | None,
+    ) -> None:
+        """Initialize engine-wide settings resolved from pipeline metadata."""
+        self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        self._duplex_runtime_extension_path = (
+            pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
+        )
+        self.duplex_serving_adapter_path = (
+            pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
+        )
+        self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
+        self.duplex_session_config = DuplexSessionRuntimeConfig()
+        if config_path is not None:
+            self.duplex_session_config = load_deploy_config(config_path).duplex_session
+
     def _resolve_stage_configs(
         self,
         model: str,
@@ -961,42 +1027,43 @@ class AsyncOmniEngine:
 
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
-        stage_overrides = kwargs.pop("stage_overrides", None)
+        # CLI callers arrive pre-parsed; offline Python callers may use the
+        # JSON-string form documented in recipes.
+        stage_overrides = parse_stage_overrides(kwargs.pop("stage_overrides", None))
 
-        resolved = resolve_omni_config(
-            model,
-            trust_remote_code=trust_remote_code,
-            cli_overrides=kwargs,
-            deploy_config_path=deploy_config_path,
-            stage_overrides=stage_overrides,
-            strategy_config_path=strategy_config_path,
-        )
-        config_path = resolved.config_path
-        stage_configs = list(resolved.stage_configs)
-        strategy_lb_policy = resolved.omni_lb_policy
-        self.endpoint_restrictions = resolved.endpoint_restrictions
-        pipeline_config = resolved.pipeline_config
-        self._duplex_runtime_extension_path = (
-            pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
-        )
-        self.duplex_serving_adapter_path = (
-            pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
-        )
-        self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
-        self.duplex_session_config = DuplexSessionRuntimeConfig()
-        if pipeline_config is not None and config_path is not None:
-            self.duplex_session_config = load_deploy_config(config_path).duplex_session
+        # ``diffusion_streaming_output`` is the public AsyncOmni/serve kwarg;
+        # stage configs know the field as ``streaming_output``. Mirror only a
+        # truthy value so the CLI's False default does not override deploy YAML.
+        if kwargs.get("diffusion_streaming_output") and kwargs.get("streaming_output") is None:
+            kwargs["streaming_output"] = True
 
-        # The shared resolver has already applied deploy, CLI, strategy, and
-        # forced-aligner policy. Its structured stages are the sole planning input.
-        self._typed_stage_configs = stage_configs
+        resolution = cast(
+            _ConfigResolutionResult,
+            load_and_resolve_stage_configs(
+                model,
+                kwargs,
+                trust_remote_code=trust_remote_code,
+                deploy_config_path=deploy_config_path,
+                stage_overrides=stage_overrides,
+                strategy_config_path=strategy_config_path,
+            ),
+        )
+        if isinstance(resolution, OmniConfigResolution):
+            self._config_resolution = resolution
+            config_path = resolution.config_path
+            stage_configs = list(resolution.stage_configs)
+            strategy_lb_policy = resolution.omni_lb_policy
+        else:
+            # Compatibility for overrides of the historical tuple-returning
+            # seam. Production always receives OmniConfigResolution above.
+            config_path, stage_configs, strategy_lb_policy = resolution
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an orchestrator-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
-        return config_path, stage_configs
+        return cast(str, config_path), stage_configs
 
     # ==================== Public API ====================
 

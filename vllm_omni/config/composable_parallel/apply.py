@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Apply declarative parallel strategies onto merged stage configs.
 
 This is the *override-after-merge* seam. ``merge_pipeline_deploy`` first fuses

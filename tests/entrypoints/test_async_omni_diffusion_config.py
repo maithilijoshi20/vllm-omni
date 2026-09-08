@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
@@ -40,6 +42,92 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["vae_use_slicing"] is True
     assert engine_args["parallel_config"]["ulysses_degree"] == 2
     assert engine_args["model_stage"] == "diffusion"
+
+
+def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {
+            "ulysses_degree": 4,
+            "ulysses_a2a_permute": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["ulysses_degree"] == 4
+    assert parallel_config["ulysses_a2a_permute"] is True
+
+
+def test_default_stage_config_preserves_model_extras():
+    stage_cfg = StageConfigFactory.create_default_diffusion({"extras": {"ltx2_use_conv_vae": True}})[0]
+
+    assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+
+
+def test_default_stage_config_preserves_and_overrides_promoted_extras():
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": None,
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
+    assert extras["default_llama_model_id"] == "extras/default-llama"
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": "/models/top-level-llama",
+            "default_llama_model_id": "top-level/default-llama",
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
+    assert extras["default_llama_model_id"] == "top-level/default-llama"
+
+
+@pytest.mark.parametrize(
+    "stage_overrides",
+    [
+        {"0": {"extras": {"ltx2_use_conv_vae": True}}},
+        '{"0":{"extras":{"ltx2_use_conv_vae":true}}}',
+    ],
+)
+def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker, stage_overrides):
+    """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
+    mocker.patch(
+        "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
+        return_value=None,
+    )
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "LTX2Pipeline"),
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "/models/LTX-2.5-Diffusers",
+        {"stage_overrides": stage_overrides},
+        trust_remote_code=False,
+    )
+
+    assert stage_configs[0].diffusion_config.extras["ltx2_use_conv_vae"] is True
+
+
+def test_default_stage_rejects_unknown_nested_parallel_config_key():
+    unknown_key = "unknown_parallel_field"
+    with pytest.raises(ValidationError, match=unknown_key):
+        StageConfigFactory.create_default_diffusion(
+            {"parallel_config": {unknown_key: 2}},
+        )
 
 
 def test_default_cache_config_used_when_missing():
@@ -262,6 +350,29 @@ def test_serve_cli_accepts_ulysses_mode():
     assert args.ulysses_mode == "advanced_uaa"
     assert parallel_config["ulysses_degree"] == 4
     assert parallel_config["ulysses_mode"] == "advanced_uaa"
+
+
+def test_serve_cli_accepts_text_encoder_tp_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--text-encoder-tp-size",
+            "4",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.text_encoder_tp_size == 4
+    assert parallel_config["text_encoder_tp_size"] == 4
 
 
 def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
@@ -683,7 +794,7 @@ def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
         strategy_config_path=None,
     )
     stage = resolved.stage_configs[0]
-    launched = {}
+    launched: dict[str, Any] = {}
     client = SimpleNamespace(input_address=None, shutdown=mocker.Mock())
 
     mocker.patch.object(runtime_module, "prepare_engine_environment")

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import json
 import os
 import types
 from dataclasses import fields, is_dataclass
@@ -50,6 +54,36 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
     except Exception as e:
         # Fallback for OmegaConf or similar if direct set fails?
         logger.error(f"Failed to inject omni connector config into stage: {e}")
+
+
+def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
+    """Parse and validate the shape of per-stage JSON overrides."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
+    else:
+        parsed = value
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "--stage-overrides must be a JSON object mapping stage_id -> overrides, "
+            f"got {type(parsed).__name__}: {parsed!r}"
+        )
+    for stage_id, overrides in parsed.items():
+        if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
+            raise ValueError(
+                f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id!r}"
+            )
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
+            )
+
+    return parsed
 
 
 def get_final_stage_id_for_e2e(
@@ -222,7 +256,7 @@ def detect_pid_host() -> bool:
     if not ic:
         return True
 
-    return has_pid_host()
+    return has_pid_host() is True
 
 
 ### Helpers for handling delta messages

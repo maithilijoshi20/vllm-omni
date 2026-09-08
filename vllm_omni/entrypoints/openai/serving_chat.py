@@ -3304,7 +3304,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_compression: int = 100,
         size: str = "auto",
         raw_request: Request | None = None,
-    ) -> tuple[list[Image.Image], dict[str, Any], float, str | None] | ErrorResponse | AsyncIterator[str]:
+    ) -> (
+        tuple[list[Image.Image], dict[str, Any], float, str | None, dict[str, Any] | None]
+        | ErrorResponse
+        | AsyncIterator[str]
+    ):
         """Generate diffusion images and return raw images plus generation stats."""
         if request_id is None:
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -3391,6 +3395,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         images = getattr(result, "images", [])
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
+        response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
         cot_output = None
 
         req_out = result
@@ -3423,7 +3428,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
 
-        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
+        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output, response_metrics
 
     async def _stream_diffusion_image_chunks(
         self,

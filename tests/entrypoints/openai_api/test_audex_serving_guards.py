@@ -172,7 +172,7 @@ class TestAudexCfgValidation:
 class TestAudexCfgInjection:
     def _serving_with_fake_tokenizer(self):
         serving = _serving()
-        serving._get_audex_tokenizer = lambda: _MarkerTokenizer()
+        serving._adapter._get_tokenizer = lambda: _MarkerTokenizer()
         return serving
 
     def _cond_prompt(self, text: str = "Hello world.") -> str:
@@ -286,8 +286,9 @@ def test_guided_injection_sets_guided_temperature():
 
 
 def test_typed_full_pipeline_uses_full_checkpoint_tokenizer(mocker):
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+
     serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
-    serving._audex_tokenizer = None
     serving._tts_stage = SimpleNamespace(
         stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="audex_omni"),
         model_config=SimpleNamespace(model_arch=None),
@@ -302,7 +303,8 @@ def test_typed_full_pipeline_uses_full_checkpoint_tokenizer(mocker):
     )
     from_pretrained = mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=object())
 
-    serving._get_audex_tokenizer()
+    adapter = AudexAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
+    adapter._get_tokenizer()
 
     ensure_snapshot.assert_called_once_with("/models/audex", profile="full")
     from_pretrained.assert_called_once_with("/snapshots/audex/checkpoint_folder_full")
@@ -376,8 +378,8 @@ class TestAdapterRouting:
 class TestAudexTTAInjection:
     def _serving(self):
         serving = _serving(model_type="audex_tta")
-        serving._get_audex_tokenizer = lambda: _TTAVocabTokenizer()
-        serving._audex_tta_rvq = None
+        serving._adapter._get_tokenizer = lambda: _TTAVocabTokenizer()
+        serving._adapter._tta_rvq = None
         return serving
 
     def _prompt(self):

@@ -141,6 +141,22 @@ def _flatten_stage_overrides(
             cli_overrides[f"stage_{stage_id}_{key}"] = value
 
 
+def _apply_generic_stage_overrides(
+    cli_overrides: dict[str, Any],
+    stage_overrides: Mapping[str, Mapping[str, Any]] | None,
+) -> None:
+    """Apply stage-zero overrides to the generic single-stage fallback."""
+    if not stage_overrides or not (stage_zero := stage_overrides.get("0")):
+        return
+    for key, value in stage_zero.items():
+        if key == "extras":
+            if not isinstance(value, Mapping):
+                raise TypeError(f"stage override '0'.extras must be a mapping, got {type(value).__name__}")
+            cli_overrides[key] = {**dict(cli_overrides.get(key) or {}), **value}
+        else:
+            cli_overrides[key] = value
+
+
 def _load_strategy_specs(strategy_config_path: str | None) -> Mapping[Any, Any] | None:
     if strategy_config_path is None:
         return None
@@ -168,8 +184,9 @@ def _resolve_generic_diffusion_model_class(
     model_class_name = cli_overrides.get("model_class_name") or resolve_model_class_name(
         model,
         str(cli_overrides.get("diffusion_load_format") or "default"),
+        cli_overrides.get("revision"),
     )
-    supported = bool(model_class_name and DiffusionModelRegistry._try_load_model_cls(str(model_class_name)) is not None)
+    supported = bool(model_class_name and model_class_name in DiffusionModelRegistry.get_supported_archs())
     if not supported:
         supported = is_diffusion_model(model)
     return supported, str(model_class_name) if model_class_name else None
@@ -187,19 +204,21 @@ def resolve_omni_config(
     """Resolve registry/deploy inputs through the single public entrypoint."""
     normalized_overrides = _convert_dataclasses_to_dict(dict(cli_overrides or {}))
     normalized_overrides = with_trust_remote_code_override(normalized_overrides, trust_remote_code)
-    _flatten_stage_overrides(normalized_overrides, stage_overrides)
+    registry_overrides = dict(normalized_overrides)
+    _flatten_stage_overrides(registry_overrides, stage_overrides)
 
     strategy_specs = _load_strategy_specs(strategy_config_path)
     structured_config = StageConfigFactory.create_from_model(
         model,
         trust_remote_code=trust_remote_code,
-        cli_overrides=normalized_overrides,
+        cli_overrides=registry_overrides,
         deploy_config_path=deploy_config_path,
         strategy_specs=strategy_specs,
     )
     if structured_config is not None:
         return _build_registered_resolution(structured_config)
 
+    _apply_generic_stage_overrides(normalized_overrides, stage_overrides)
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
     if not supported:
         raise ValueError(

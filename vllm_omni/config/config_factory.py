@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,15 @@ logger = init_logger(__name__)
 # defaults can't drift apart. This is the light slice; the full device-layout
 # centralization is tracked as a follow-up.
 _DEFAULT_PARALLEL_DEGREE = 1
+
+
+@dataclass(frozen=True)
+class _LegacyConfigResolution:
+    """Factory-owned result for the temporary legacy runtime bridge."""
+
+    stage_configs: list[StageConfig]
+    pipeline_config: PipelineConfig
+    omni_lb_policy: str | None
 
 
 @functools.cache
@@ -454,14 +463,29 @@ class StageConfigFactory:
         user_deploy_config: DeployConfig | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
     ) -> tuple[list[StageConfig], str | None]:
-        """Create current runtime StageConfigs from registry + deploy YAML.
+        """Return the existing two-value legacy runtime ABI."""
+        resolved = cls._resolve_legacy_from_registry(
+            pipeline_cfg,
+            cli_overrides,
+            deploy_config_path,
+            user_deploy_config,
+            strategy_specs,
+        )
+        return resolved.stage_configs, resolved.omni_lb_policy
+
+    @classmethod
+    def _resolve_legacy_from_registry(
+        cls,
+        pipeline_cfg: PipelineConfig,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None = None,
+        user_deploy_config: DeployConfig | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
+    ) -> _LegacyConfigResolution:
+        """Create runtime stages and retain their effective topology.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
-
-        Returns ``(stages, omni_lb_policy)`` — the strategy-derived pipeline-wide
-        load-balancer policy (``None`` when no strategy set one) travels with the
-        stages instead of through a mutable out-param.
         """
         cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
         deploy_cfg: DeployConfig | None
@@ -500,7 +524,11 @@ class StageConfigFactory:
         cls._reconcile_strategy_with_cli(stages, applied)
 
         omni_lb_policy = applied.omni_lb_policy if applied is not None else None
-        return stages, omni_lb_policy
+        return _LegacyConfigResolution(
+            stage_configs=stages,
+            pipeline_config=pipeline_cfg,
+            omni_lb_policy=omni_lb_policy,
+        )
 
     @staticmethod
     def _apply_strategy_specs(
@@ -633,14 +661,24 @@ class StageConfigFactory:
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(kwargs)
 
         extras = dict(engine_args.get("extras") or {})
-        extras.setdefault("auxiliary_text_encoder", kwargs.get("auxiliary_text_encoder"))
-        extras.setdefault(
-            "default_llama_model_id",
-            kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-        )
+        for key, default in (
+            ("auxiliary_text_encoder", None),
+            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        ):
+            value = kwargs.get(key)
+            if value is not None:
+                extras[key] = value
+            else:
+                extras.setdefault(key, default)
         engine_args["extras"] = extras
 
-        final_output_type = get_diffusion_output_type(engine_args.get("model_class_name"))
+        model_class_name = engine_args.get("model_class_name")
+        final_output_type = get_diffusion_output_type(model_class_name)
+        logger.info(
+            "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
+            final_output_type,
+            model_class_name,
+        )
         return engine_args, parallel_config, default_sampling_params, final_output_type
 
     @classmethod
@@ -683,11 +721,6 @@ class StageConfigFactory:
             cls._normalize_default_diffusion(kwargs)
         )
         engine_overrides.update(asdict(parallel_config))
-        engine_overrides["model"] = model
-        engine_overrides["stage_0_devices"] = kwargs.get("stage_0_devices") or ",".join(
-            str(i) for i in range(parallel_config.world_size)
-        )
-
         model_class_name = engine_overrides.get("model_class_name")
         pipeline = PipelineConfig(
             model_type="generic_diffusion",
@@ -704,10 +737,18 @@ class StageConfigFactory:
             ),
         )
 
-        return VllmOmniConfig.from_pipeline_config(
-            pipeline,
-            cli_overrides=engine_overrides,
+        # These values have already been normalized for this diffusion stage.
+        # Scope them explicitly so diffusion-only fields such as engine_backend
+        # and extras are not filtered by the global LLM CLI argument surface.
+        stage_overrides = {
+            f"stage_0_{key}": value for key, value in engine_overrides.items() if key not in {"model", "stage_id"}
+        }
+        stage_overrides["stage_0_devices"] = (
+            kwargs.get("stage_0_devices")
+            or kwargs.get("devices")
+            or ",".join(str(i) for i in range(parallel_config.world_size))
         )
+        return VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={"model": model, **stage_overrides})
 
     @classmethod
     def _merge_cli_overrides(
