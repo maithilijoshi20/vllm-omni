@@ -1134,6 +1134,32 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     assert handler.supports_mixed_reference_inputs
 
 
+def test_typed_stage_drives_video_capability_checks():
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    minimax_stage = StageConfigFactory.create_typed_default_diffusion(
+        "minimax-h3",
+        {"model_class_name": "MiniMaxH3Pipeline"},
+    ).stage_configs[0]
+    minimax_handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name=None)),
+        model_name="minimax-h3",
+        stage_configs=[minimax_stage],
+    )
+    assert minimax_handler.supports_mixed_reference_inputs
+
+    cosmos_stage = StageConfigFactory.create_typed_default_diffusion(
+        "cosmos3",
+        {"model_class_name": "Cosmos3OmniDiffusersPipeline"},
+    ).stage_configs[0]
+    cosmos_handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=SimpleNamespace(model_class_name=None)),
+        model_name="cosmos3",
+        stage_configs=[cosmos_stage],
+    )
+    assert cosmos_handler.supported_control_upload_types == frozenset({"edge", "blur", "depth", "seg", "wsm"})
+
+
 @pytest.mark.parametrize("model_class_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
 def test_control_upload_capability_is_declared_only_by_cosmos3(test_client, model_class_name):
     handler = test_client.app.state.openai_serving_video

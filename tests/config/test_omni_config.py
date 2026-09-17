@@ -124,6 +124,18 @@ def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["turn", "turn"]
 
 
+def test_nested_stage_override_deep_merges_structured_model_config() -> None:
+    config = _from_pipeline_key(
+        "cosmos3_policy",
+        deploy_config_path=get_deploy_config_path("cosmos3_policy_droid.yaml"),
+        cli_overrides={"stage_0_model_config": {"guardrails": False}},
+    )
+
+    model_config = config.stage_by_id(0).model_config
+    assert model_config.guardrails is False
+    assert model_config.policy_server_config["action_space"] == "joint_position"
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)

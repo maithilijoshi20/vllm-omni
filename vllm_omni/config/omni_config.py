@@ -44,6 +44,7 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
     StageType,
     _apply_platform_overrides,
+    _get_recursively_merged_dict,
     _resolve_scheduler,
     _scheduler_path,
     _select_processor_funcs,
@@ -1326,7 +1327,12 @@ def _stage_engine_values(
         if topology.execution_type == StageExecutionType.DIFFUSION:
             # Mirror StageConfig.to_omegaconf so both projections resolve alike.
             reconcile_diffusion_attention_overrides(engine, stage_cli_overrides)
-        engine.update(_copy_value(stage_cli_overrides))
+        for key, value in stage_cli_overrides.items():
+            existing = engine.get(key)
+            if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, Mapping):
+                engine[key] = _get_recursively_merged_dict(existing, dict(value))
+            else:
+                engine[key] = _copy_value(value)
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,

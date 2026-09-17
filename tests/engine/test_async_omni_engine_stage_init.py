@@ -12,6 +12,7 @@ import types
 import pytest
 from omegaconf import OmegaConf
 
+from vllm_omni.config.omni_config import OmniStageRuntimeConfig
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -21,10 +22,21 @@ from vllm_omni.engine.stage_init_utils import (
     build_stage0_input_processor,
     compute_replica_layout,
     split_devices_for_replicas,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
+    env_key = "VLLM_OMNI_TEST_TYPED_STAGE_ENV"
+    monkeypatch.delenv(env_key, raising=False)
+
+    with stage_runtime_env(0, OmniStageRuntimeConfig(env={env_key: "typed-value"})):
+        assert os.environ[env_key] == "typed-value"
+
+    assert env_key not in os.environ
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
