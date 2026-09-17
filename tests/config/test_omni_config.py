@@ -131,9 +131,9 @@ def test_nested_stage_override_deep_merges_structured_model_config() -> None:
         cli_overrides={"stage_0_model_config": {"guardrails": False}},
     )
 
-    model_config = config.stage_by_id(0).model_config
-    assert model_config.guardrails is False
-    assert model_config.policy_server_config["action_space"] == "joint_position"
+    model_config = config.stage_by_id(0).diffusion_config.model_config
+    assert model_config["guardrails"] is False
+    assert model_config["policy_server_config"]["action_space"] == "joint_position"
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
