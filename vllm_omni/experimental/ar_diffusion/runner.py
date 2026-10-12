@@ -578,16 +578,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         record_output_peak_memory: bool,
         in_diffusion_kv_memory_profile: bool = False,
     ) -> BatchRunnerOutput:
-        """Run the shared single-step core once, or repeatedly until the chunk boundary.
+        """Run the shared single-step core once, or repeatedly up to the step before the chunk boundary.
 
         The shared runner keeps its one-step-per-call semantics. When the
-        grouping policy applies, the remaining steps of the request's current
+        grouping policy applies, further steps of the request's current
         chunk are driven from here with a continuation of the scheduler
         output: the request is presented as a cached request, with nothing
         new to admit, nothing to retire and no connector work, so every
         further step is exactly what the next scheduler cycle would have
-        asked for. Grouping the probes and the commit of one block this way
-        drops the scheduler/executor round trips between them.
+        asked for. Grouping steps this way drops the scheduler/executor
+        round trips between them.
 
         The final step is deliberately not grouped. Returning at the
         penultimate step gives the scheduler an opportunity to process RPCs

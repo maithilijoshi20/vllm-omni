@@ -147,7 +147,7 @@ class _ThreeStepChunkPipeline(_ChunkedStepPipeline):
         return state
 
 
-class _InteractiveChunkedStepPipeline(_ChunkedStepPipeline):
+class _InteractiveChunkedStepPipeline(_ThreeStepChunkPipeline):
     def __init__(self):
         super().__init__()
         self.pending_interaction = None
@@ -176,7 +176,7 @@ class _OneStepInteractiveChunkPipeline(_InteractiveChunkedStepPipeline):
         return state
 
 
-class _BatchDependentChunkPipeline(_ChunkedStepPipeline):
+class _BatchDependentChunkPipeline(_ThreeStepChunkPipeline):
     """Streaming stub whose noise depends on the batch's latents and timesteps, so a stale batch shows."""
 
     def __init__(self):
@@ -207,7 +207,7 @@ class _BatchDependentChunkPipeline(_ChunkedStepPipeline):
         return super().post_decode(state, **kwargs)
 
 
-class _FailsMidChunkPipeline(_ChunkedStepPipeline):
+class _FailsMidChunkPipeline(_ThreeStepChunkPipeline):
     """Streaming stub whose second denoise step of the first chunk raises."""
 
     def step_scheduler(self, state, noise_pred, **kwargs):
@@ -899,10 +899,16 @@ class TestRunner:
             step += 1
         return [o.get_request_output("req-1") for o in outputs]
 
+    @pytest.mark.parametrize(
+        ("pipeline_cls", "steps_per_chunk", "grouped_calls"),
+        [(_ChunkedStepPipeline, 2, [1, 2, 3, 4]), (_ThreeStepChunkPipeline, 3, [2, 3, 5, 6])],
+    )
     @pytest.mark.parametrize("grouping", [False, True])
-    def test_ar_runner_leaves_the_chunk_boundary_step_for_a_fresh_call(self, monkeypatch, grouping):
-        """Grouping stops before each boundary without changing chunk outputs."""
-        runner = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=grouping)
+    def test_ar_runner_leaves_the_chunk_boundary_step_for_a_fresh_call(
+        self, monkeypatch, grouping, pipeline_cls, steps_per_chunk, grouped_calls
+    ):
+        """Grouping runs the steps before each boundary in one call, without changing chunk outputs."""
+        runner = self._make_grouping_runner(pipeline_cls(), grouping=grouping)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
         denoise_calls_after_each_call = []
         original = runner.execute_stepwise
@@ -914,18 +920,20 @@ class TestRunner:
 
         runner.execute_stepwise = counting
 
+        total_steps = 2 * steps_per_chunk
         per_call = self._drive_to_completion(runner)
 
         # Chunk outputs, and the steps they were emitted at, are identical.
         emitted = [(o.step_index, float(o.result.output[0])) for o in per_call if o.result is not None]
-        assert emitted == [(2, 0.0), (2, 1.0)]
+        assert emitted == [(steps_per_chunk, 0.0), (steps_per_chunk, 1.0)]
         assert per_call[-1].finished is True
-        assert runner.pipeline.denoise_calls == 4 and runner.pipeline.scheduler_calls == 4
+        assert runner.pipeline.denoise_calls == total_steps and runner.pipeline.scheduler_calls == total_steps
         assert runner.pipeline.decode_calls == 2
         assert runner.pipeline.prepare_calls == 1
-        # The final step of each two-step chunk runs in a fresh call, giving
-        # the scheduler control before the chunk boundary.
-        assert denoise_calls_after_each_call == [1, 2, 3, 4]
+        # The final step of each chunk runs in a fresh call, giving the
+        # scheduler control before the chunk boundary; with two-step chunks
+        # that leaves nothing to group.
+        assert denoise_calls_after_each_call == (grouped_calls if grouping else list(range(1, total_steps + 1)))
         assert "req-1" not in runner.state_cache
 
     def test_ar_runner_applies_interaction_queued_after_grouped_work_at_the_next_boundary(self, monkeypatch):
@@ -937,12 +945,13 @@ class TestRunner:
 
         first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
         assert first.get_request_output("req-1").result is None
-        assert pipeline.denoise_calls == 1
+        assert pipeline.denoise_calls == 2
 
         pipeline.pending_interaction = "updated prompt"
         boundary = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
 
         assert boundary.get_request_output("req-1").result is not None
+        assert pipeline.denoise_calls == 3
         assert pipeline.applied_interactions == ["updated prompt"]
 
     def test_ar_runner_one_step_chunk_cannot_yield_before_its_boundary(self, monkeypatch):
@@ -1001,20 +1010,18 @@ class TestRunner:
             finals[grouping] = float(runner.pipeline.final_latent)
             seen[grouping] = runner.pipeline.seen
 
-        # 1 -> +(1+10)=12 -> +(12+5)=29 -> +(29+10)=68 -> +(68+5)=141 in both modes.
-        assert seen[False] == [(1.0, 10.0), (12.0, 5.0), (29.0, 10.0), (68.0, 5.0)]
+        # x -> 2x + t, in both modes:
+        # 1 -> 12 -> 29 -> 59 | 59 -> 128 -> 261 -> 523.
+        assert seen[False] == [(1.0, 10.0), (12.0, 5.0), (29.0, 1.0), (59.0, 10.0), (128.0, 5.0), (261.0, 1.0)]
         assert seen[True] == seen[False]
-        assert finals[True] == finals[False] == 141.0
+        assert finals[True] == finals[False] == 523.0
 
     def test_ar_runner_grouped_chunk_stops_at_a_failing_step_and_drops_the_state(self, monkeypatch):
         """A failure mid-chunk ends the grouped call with that step's error; nothing runs after it."""
         runner = self._make_grouping_runner(_FailsMidChunkPipeline(), grouping=True)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
-        assert first.get_request_output("req-1").finished is False
-
-        output = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
+        output = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
 
         failed = output.get_request_output("req-1")
         assert failed.finished is True
