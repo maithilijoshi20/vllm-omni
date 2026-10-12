@@ -8,6 +8,7 @@ import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -29,6 +30,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -133,6 +135,34 @@ class _ChunkedStepPipeline(_StepPipeline):
         state.chunk_index += 1
         state.step_in_chunk = 0
         return result
+
+
+class _ThreeStepChunkPipeline(_ChunkedStepPipeline):
+    """Streaming stub with enough steps to exercise an internal continuation."""
+
+    def prepare_encode(self, state, **kwargs):
+        state = super().prepare_encode(state, **kwargs)
+        state.timesteps = [torch.tensor(10), torch.tensor(5), torch.tensor(1)] * 2
+        state.chunk_num_steps = 3
+        return state
+
+
+class _InteractiveChunkedStepPipeline(_ChunkedStepPipeline):
+    def __init__(self):
+        super().__init__()
+        self.pending_interaction = None
+        self.applied_interactions = []
+
+    def peek_chunk_media(self, state):
+        del state
+        return ChunkMediaSpec(num_media_frames=1, fps=1.0, num_latent_frames=1)
+
+    def apply_interaction_at_chunk_boundary(self, state):
+        del state
+        self.applied_interactions.append(self.pending_interaction)
+
+    def prepare_next_chunk(self, state):
+        del state
 
 
 class _BatchDependentChunkPipeline(_ChunkedStepPipeline):
@@ -859,10 +889,8 @@ class TestRunner:
         return [o.get_request_output("req-1") for o in outputs]
 
     @pytest.mark.parametrize("grouping", [False, True])
-    def test_ar_runner_runs_every_step_of_a_chunk_in_one_call_when_the_pipeline_declares_it(
-        self, monkeypatch, grouping
-    ):
-        """With the capability declared, one AR runner call drives a whole chunk; the outputs are the same either way."""
+    def test_ar_runner_leaves_the_chunk_boundary_step_for_a_fresh_call(self, monkeypatch, grouping):
+        """Grouping stops before each boundary without changing chunk outputs."""
         runner = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=grouping)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
         denoise_calls_after_each_call = []
@@ -884,14 +912,31 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 4 and runner.pipeline.scheduler_calls == 4
         assert runner.pipeline.decode_calls == 2
         assert runner.pipeline.prepare_calls == 1
-        # One call per chunk with the capability, one per step without; a
-        # grouped call never crosses into the next chunk.
-        assert denoise_calls_after_each_call == ([2, 4] if grouping else [1, 2, 3, 4])
+        # The final step of each two-step chunk runs in a fresh call, giving
+        # the scheduler control before the chunk boundary.
+        assert denoise_calls_after_each_call == [1, 2, 3, 4]
         assert "req-1" not in runner.state_cache
+
+    def test_ar_runner_applies_interaction_queued_after_grouped_work_at_the_next_boundary(self, monkeypatch):
+        """An RPC serviced after grouped work still applies before the next chunk is prepared."""
+        pipeline = _InteractiveChunkedStepPipeline()
+        runner = self._make_grouping_runner(pipeline, grouping=True)
+        runner._interaction_coordinator = MagicMock()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+        assert first.get_request_output("req-1").result is None
+        assert pipeline.denoise_calls == 1
+
+        pipeline.pending_interaction = "updated prompt"
+        boundary = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
+
+        assert boundary.get_request_output("req-1").result is not None
+        assert pipeline.applied_interactions == ["updated prompt"]
 
     def test_ar_runner_continues_a_grouped_chunk_as_a_cached_request(self, monkeypatch):
         """The first step admits the new request; every further step of the chunk is a cached-request continuation."""
-        runner = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=True)
+        runner = self._make_grouping_runner(_ThreeStepChunkPipeline(), grouping=True)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
         seen = []
         original_core = DiffusionModelRunner._execute_stepwise_core
@@ -904,7 +949,7 @@ class TestRunner:
 
         first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4), finished_req_ids={"old"}))
 
-        assert first.get_request_output("req-1").result is not None
+        assert first.get_request_output("req-1").result is None
         assert runner.pipeline.prepare_calls == 1
         assert len(seen) == 2
         assert [n.request_id for n in seen[0].scheduled_new_reqs] == ["req-1"]
@@ -936,7 +981,10 @@ class TestRunner:
         runner = self._make_grouping_runner(_FailsMidChunkPipeline(), grouping=True)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        output = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+        assert first.get_request_output("req-1").finished is False
+
+        output = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
 
         failed = output.get_request_output("req-1")
         assert failed.finished is True
@@ -1137,9 +1185,7 @@ class TestRunner:
         failed, entering that broadcast while the peer enters the failure
         all-reduce would hang.
         """
-        from unittest.mock import MagicMock
-
-        from vllm_omni.diffusion.interaction.types import ChunkMediaSpec, InteractionChunkMetadata
+        from vllm_omni.diffusion.interaction.types import InteractionChunkMetadata
 
         class _InteractionStepPipeline(_StepPipeline):
             def __init__(self):
