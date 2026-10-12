@@ -165,6 +165,17 @@ class _InteractiveChunkedStepPipeline(_ChunkedStepPipeline):
         del state
 
 
+class _OneStepInteractiveChunkPipeline(_InteractiveChunkedStepPipeline):
+    """Interactive stub whose chunks reach their boundary in one step."""
+
+    def prepare_encode(self, state, **kwargs):
+        state = super().prepare_encode(state, **kwargs)
+        state.timesteps = [torch.tensor(10)] * 3
+        state.chunk_num_steps = 1
+        state.total_chunks = 3
+        return state
+
+
 class _BatchDependentChunkPipeline(_ChunkedStepPipeline):
     """Streaming stub whose noise depends on the batch's latents and timesteps, so a stale batch shows."""
 
@@ -933,6 +944,25 @@ class TestRunner:
 
         assert boundary.get_request_output("req-1").result is not None
         assert pipeline.applied_interactions == ["updated prompt"]
+
+    def test_ar_runner_one_step_chunk_cannot_yield_before_its_boundary(self, monkeypatch):
+        """A one-step chunk retains baseline latency because no pre-boundary yield point exists."""
+        pipeline = _OneStepInteractiveChunkPipeline()
+        runner = self._make_grouping_runner(pipeline, grouping=True)
+        runner._interaction_coordinator = MagicMock()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(3)))
+
+        assert first.get_request_output("req-1").result is not None
+        assert pipeline.denoise_calls == 1
+        assert pipeline.applied_interactions == [None]
+
+        pipeline.pending_interaction = "updated prompt"
+        second = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
+
+        assert second.get_request_output("req-1").result is not None
+        assert pipeline.applied_interactions == [None, "updated prompt"]
 
     def test_ar_runner_continues_a_grouped_chunk_as_a_cached_request(self, monkeypatch):
         """The first step admits the new request; every further step of the chunk is a cached-request continuation."""

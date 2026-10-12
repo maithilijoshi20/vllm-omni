@@ -560,6 +560,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         boundary is left for a fresh call. This lets the scheduler process an
         interaction that arrived during the grouped work before the pipeline
         applies interactions and prepares the next chunk.
+
+        This can only reduce interaction latency for chunks with at least two
+        denoise steps. A one-step chunk has no pre-boundary step at which to
+        yield, so it retains the baseline one-call interaction latency.
         """
         return (
             bool(self.od_config.streaming_output)
@@ -588,6 +592,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         The final step is deliberately not grouped. Returning at the
         penultimate step gives the scheduler an opportunity to process RPCs
         before the next call reaches the chunk boundary.
+        One-step chunks have no penultimate step, so their boundary remains
+        part of the first call.
 
         The loop stops at the first call that emits a result (a chunk or an
         error), finishes the request, or leaves it without state; the base
