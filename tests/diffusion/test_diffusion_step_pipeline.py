@@ -8,6 +8,7 @@ import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,7 +31,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
-from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.types import (
+    ChunkMediaSpec,
+    InteractionChunkMetadata,
+)
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -50,7 +55,10 @@ from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.errors import OmniClientError
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniInteractionPrompt,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -163,6 +171,58 @@ class _InteractiveChunkedStepPipeline(_ThreeStepChunkPipeline):
 
     def prepare_next_chunk(self, state):
         del state
+
+
+class _RecordingInteractionCoordinator:
+    """Minimal coordinator fake that records production submission and apply calls."""
+
+    needs_chunk_media = False
+
+    def __init__(self):
+        self.pending_event = None
+        self.enqueued_events = []
+        self.applied_events = []
+
+    def enqueue_parts(
+        self,
+        state,
+        *,
+        parts,
+        event_id,
+        received_at,
+        transition_chunks,
+    ):
+        del received_at, transition_chunks
+        prompt = parts[0][1]["prompt"]
+        self.pending_event = (event_id, prompt)
+        self.enqueued_events.append((state.request_id, event_id, prompt))
+
+    def maybe_prepare_initial_session(self, state, pipeline):
+        del state, pipeline
+        return InteractionChunkMetadata()
+
+    def apply_at_chunk_boundary(self, state, **kwargs):
+        del kwargs
+        assert self.pending_event is not None
+        event_id, prompt = self.pending_event
+        self.pending_event = None
+        self.applied_events.append((state.request_id, event_id, prompt))
+        return InteractionChunkMetadata(
+            started_event_ids=[event_id],
+            active_event_ids=[event_id],
+        )
+
+
+class _CoordinatedInteractiveChunkPipeline(InteractionMixin, _ThreeStepChunkPipeline):
+    """Interactive stub using the production chunk-boundary mixin."""
+
+    def __init__(self):
+        super().__init__()
+        self._interaction_coordinator = None
+
+    def peek_chunk_media(self, state):
+        del state
+        return ChunkMediaSpec(num_media_frames=1, fps=1.0, num_latent_frames=1)
 
 
 class _OneStepInteractiveChunkPipeline(_InteractiveChunkedStepPipeline):
@@ -938,21 +998,33 @@ class TestRunner:
 
     def test_ar_runner_applies_interaction_queued_after_grouped_work_at_the_next_boundary(self, monkeypatch):
         """An RPC serviced after grouped work still applies before the next chunk is prepared."""
-        pipeline = _InteractiveChunkedStepPipeline()
+        pipeline = _CoordinatedInteractiveChunkPipeline()
         runner = self._make_grouping_runner(pipeline, grouping=True)
-        runner._interaction_coordinator = MagicMock()
+        coordinator = _RecordingInteractionCoordinator()
+        runner._interaction_coordinator = coordinator
+        pipeline._interaction_coordinator = coordinator
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
         assert first.get_request_output("req-1").result is None
         assert pipeline.denoise_calls == 2
 
-        pipeline.pending_interaction = "updated prompt"
+        runner.submit_interaction(
+            "req-1",
+            cast(
+                OmniInteractionPrompt,
+                {
+                    "event_id": "ui-update-1",
+                    "event": {"prompt": "updated prompt"},
+                },
+            ),
+        )
+        assert coordinator.enqueued_events == [("req-1", "ui-update-1", "updated prompt")]
         boundary = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
 
         assert boundary.get_request_output("req-1").result is not None
         assert pipeline.denoise_calls == 3
-        assert pipeline.applied_interactions == ["updated prompt"]
+        assert coordinator.applied_events == [("req-1", "ui-update-1", "updated prompt")]
 
     def test_ar_runner_one_step_chunk_cannot_yield_before_its_boundary(self, monkeypatch):
         """A one-step chunk retains baseline latency because no pre-boundary yield point exists."""
