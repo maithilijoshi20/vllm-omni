@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.outputs import CompletionOutput
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -65,6 +66,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
@@ -74,6 +76,7 @@ from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_EMBEDDING,
     KEY_SPEAKER_SAMPLE_RATES,
@@ -460,6 +463,81 @@ class TestSpeechAPI:
             "X-VLLM-OMNI-INPUT-AUDIO-TOKENS": "4",
         }
 
+    @staticmethod
+    def _usage_tokenizer_server(trust_remote_code: bool, skip_tokenizer_init: bool = False) -> OmniOpenAIServingSpeech:
+        server = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+        server._tts_tokenizer = None
+        server.engine_client = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="org/no-hf-tokenizer",
+                trust_remote_code=trust_remote_code,
+                skip_tokenizer_init=skip_tokenizer_init,
+            )
+        )
+        return server
+
+    def test_usage_tokenizer_failure_is_not_retried_per_request(self, mocker: MockerFixture):
+        from_pretrained = mocker.patch(
+            "transformers.AutoTokenizer.from_pretrained", side_effect=ValueError("no tokenizer files")
+        )
+        server = self._usage_tokenizer_server(trust_remote_code=False)
+
+        counts = [server._count_usage_text_tokens("some lyrics") for _ in range(3)]
+
+        assert counts == [0, 0, 0]
+        assert from_pretrained.call_count == 1
+
+    @pytest.mark.parametrize("trust_remote_code", [False, True])
+    def test_usage_tokenizer_follows_server_trust_remote_code(self, mocker: MockerFixture, trust_remote_code: bool):
+        from_pretrained = mocker.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=lambda text, padding=False: {"input_ids": text.split()},
+        )
+        server = self._usage_tokenizer_server(trust_remote_code=trust_remote_code)
+
+        assert server._count_usage_text_tokens("one two three") == 3
+        assert server._count_usage_text_tokens("four five") == 2
+        from_pretrained.assert_called_once_with("org/no-hf-tokenizer", trust_remote_code=trust_remote_code)
+
+    def test_usage_tokenizer_is_not_loaded_when_the_engine_skips_tokenizer_init(self, mocker: MockerFixture):
+        from_pretrained = mocker.patch("transformers.AutoTokenizer.from_pretrained")
+        server = self._usage_tokenizer_server(trust_remote_code=False, skip_tokenizer_init=True)
+
+        assert [server._count_usage_text_tokens("some lyrics") for _ in range(2)] == [0, 0]
+        from_pretrained.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("loads", "text_tokens"),
+        [pytest.param(True, "2", id="fallback-loads"), pytest.param(False, "0", id="fallback-fails")],
+    )
+    def test_usage_header_from_the_fallback_tokenizer(
+        self, test_app, client, mocker: MockerFixture, loads: bool, text_tokens: str
+    ):
+        """A model that never sets ``_tts_tokenizer`` gets its text count from the fallback, loaded once."""
+        if loads:
+            from_pretrained = mocker.patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=lambda text, padding=False: {"input_ids": text.split()},
+            )
+        else:
+            from_pretrained = mocker.patch(
+                "transformers.AutoTokenizer.from_pretrained", side_effect=ValueError("no tokenizer files")
+            )
+        speech_server = test_app.state.openai_serving_speech
+        speech_server._tts_tokenizer = None
+        model_config = speech_server.engine_client.model_config
+        model_config.model = "tts-model"
+        model_config.trust_remote_code = False
+        model_config.skip_tokenizer_init = False
+        payload = {"input": "Hello world", "model": "tts-model", "voice": "alloy", "response_format": "wav"}
+
+        for _ in range(2):
+            response = client.post("/v1/audio/speech", json=payload)
+            assert response.status_code == 200
+            assert response.headers["x-vllm-omni-input-text-tokens"] == text_tokens
+
+        from_pretrained.assert_called_once_with("tts-model", trust_remote_code=False)
+
     def test_create_speech_mp3_format(self, client):
         payload = {
             "input": "Hello world",
@@ -525,6 +603,7 @@ class TestSpeechAPI:
         assert response.json()["voices"] == ["alice", "bob", "carol", "default"]
         assert response.json()["uploaded_voices"] == [
             {
+                "id": "carol",
                 "name": "Carol",
                 "consent": "",
                 "created_at": 1,
@@ -870,7 +949,7 @@ class TestSpeechAPI:
             diffusion_engine=engine_client,
             model_name="test-model",
         )
-        assert server._adapter is None
+        assert isinstance(server._adapter, OmniVoiceAdapter)
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="test-input", voice="test-voice"))
 
@@ -5387,8 +5466,8 @@ class TestMingTTSServing:
         assert sampling_params.max_tokens == 8
 
 
-@pytest.fixture
-def ming_flash_omni_tts_server(mocker: MockerFixture):
+@pytest.fixture(params=["ming_tts", "ming3_tts"], ids=["ming2", "ming3"])
+def ming_flash_omni_tts_server(request: pytest.FixtureRequest, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
         return_value=set(),
@@ -5410,7 +5489,7 @@ def ming_flash_omni_tts_server(mocker: MockerFixture):
     mock_engine_client.generate = mocker.MagicMock(return_value="generator")
     mock_engine_client.stage_configs = [
         SimpleNamespace(
-            engine_args=SimpleNamespace(model_stage="ming_tts"),
+            engine_args=SimpleNamespace(model_stage=request.param),
             tts_args={},
         )
     ]
@@ -5432,11 +5511,23 @@ class TestMingFlashOmniTTSServing:
         assert error is not None
         assert "ref_text" in error
 
-    def test_validate_ming_flash_omni_tts_rejects_ref_audio(self, ming_flash_omni_tts_server):
+    def test_validate_ming_ref_audio_support(self, ming_flash_omni_tts_server, mocker: MockerFixture):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
         error = ming_flash_omni_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
+        if ming_flash_omni_tts_server._tts_model_type == "ming_flash_omni_tts":
+            assert error is not None
+            assert "not yet supported" in error
+        else:
+            assert error is None
+            ming_flash_omni_tts_server._resolve_ref_audio_array = mocker.AsyncMock(
+                return_value=([0.1, -0.1], 16000, "cache-key")
+            )
+            asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
+            prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+            reference = unpack_reference_audio(prompt["additional_information"])[0]
+            assert reference["sample_rate"] == 16000
+            torch.testing.assert_close(reference["samples"], torch.tensor([0.1, -0.1]))
+            assert prompt["additional_information"]["speaker_conditioning"] == "prompt"
 
     def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
@@ -5445,7 +5536,15 @@ class TestMingFlashOmniTTSServing:
         prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["prompt_token_ids"] == [0]
         assert prompt["additional_information"]["text"] == "Hello"
-        assert prompt["additional_information"]["voice_name"] == "test"
+        info = prompt["additional_information"]
+        if ming_flash_omni_tts_server._tts_model_type == "ming_flash_omni_tts":
+            assert info["voice_name"] == "test"
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+            assert "speaker_conditioning" not in info
+        else:
+            assert info["voice_name"] is None
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "test"
+            assert info["speaker_conditioning"] == "mute"
 
 
 class TestTTSAsyncOffloading:
@@ -5654,13 +5753,14 @@ class TestTTSAsyncOffloading:
         voxtral_server._tts_model_type = legacy_tts_model_type
         mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())
         log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+        log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
 
         asyncio.run(voxtral_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
 
         assert adapter_model_type != legacy_tts_model_type
         assert any(
             call.args and call.args[0] == "TTS speech request %s: model=%s" and call.args[2] == adapter_model_type
-            for call in log_info.call_args_list
+            for call in log_info.call_args_list + log_debug.call_args_list
         )
 
     @pytest.mark.parametrize("word_timestamps", [False, True])
@@ -6301,3 +6401,24 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+@pytest.mark.parametrize("request_logger", [None, RequestLogger(max_log_len=None)])
+@pytest.mark.parametrize("diffusion", [False, True])
+def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixture, request_logger, diffusion):
+    if diffusion:
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(), model_name="test-model", request_logger=request_logger
+        )
+        assert server.request_logger is request_logger
+    else:
+        server = object.__new__(OmniOpenAIServingSpeech)
+        server.request_logger = request_logger
+    log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+    log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
+
+    server._log_request("TTS speech request %s: model=%s", "req-1", "CustomVoice")
+
+    used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
+    used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
+    unused.assert_not_called()
