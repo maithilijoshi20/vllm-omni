@@ -445,11 +445,12 @@ class OmniSchedulingCoordinator:
         target_status: RequestStatus,
         chunk_ready_req_ids: set[str],
     ) -> None:
+        """Partition large lists and bulk-remove parked queue requests."""
         is_list_queue = isinstance(queue, list)
         retained_requests: list[Any] | None = (
             [] if is_list_queue and len(queue) > _LIST_PARTITION_MIN_QUEUE_SIZE else None
         )
-        remove_request = queue.remove if is_list_queue else queue.remove_request
+        to_remove: list[Any] = []
         queue_snapshot = list(queue)
         for request in queue_snapshot:
             request_can_run = self._request_can_run(request, chunk_ready_req_ids)
@@ -481,12 +482,20 @@ class OmniSchedulingCoordinator:
                     if retained_requests is not None:
                         retained_requests.append(request)
                     continue
-            if retained_requests is None:
-                remove_request(request)
+            if not is_list_queue:
+                to_remove.append(request)
+            elif retained_requests is None:
+                queue.remove(request)
             waiting_for_chunk_list.append(request)
 
         if retained_requests is not None:
             queue[:] = retained_requests
+        elif to_remove:
+            try:
+                queue.remove_requests(to_remove)
+            except AttributeError:
+                for request in to_remove:
+                    queue.remove_request(request)
 
     def _request_can_run(
         self,
