@@ -143,7 +143,8 @@ def test_chunk_waiting_removes_request_from_running_list():
     assert list(coord._waiting_for_chunk_running) == [req]
 
 
-def test_chunk_waiting_partitions_running_list_without_remove_scans(monkeypatch):
+@pytest.mark.parametrize("queue_size", [127, 128, 129])
+def test_chunk_waiting_partitions_running_list_without_remove_scans(queue_size, monkeypatch):
     class CountingList(list):
         def __init__(self, items):
             super().__init__(items)
@@ -154,53 +155,57 @@ def test_chunk_waiting_partitions_running_list_without_remove_scans(monkeypatch)
             super().remove(item)
 
     coord = OmniSchedulingCoordinator(
-        scheduler_max_num_seqs=10,
+        scheduler_max_num_seqs=queue_size,
         stage_id=1,
         async_chunk=True,
     )
-    monkeypatch.setattr(coord_mod, "_LIST_PARTITION_MIN_QUEUE_SIZE", 0)
-    moved_first = _make_request("moved-first", status=RequestStatus.RUNNING)
-    ready_first = _make_request("ready-first", status=RequestStatus.RUNNING)
-    waiting_for_input = _make_request(
-        "waiting-for-input",
-        status=RequestStatus.WAITING_FOR_INPUT,
-    )
-    moved_second = _make_request("moved-second", status=RequestStatus.RUNNING)
-    restored_running = _make_request(
-        "restored-running",
-        status=RequestStatus.WAITING_FOR_CHUNK,
-    )
-    ready_second = _make_request("ready-second", status=RequestStatus.RUNNING)
-    running = CountingList(
-        [
-            moved_first,
-            ready_first,
-            waiting_for_input,
-            moved_second,
-            restored_running,
-            ready_second,
-        ]
-    )
-
-    coord.process_pending_chunks(
-        MockQueue(),
-        running,
-        {"ready-first", "restored-running", "ready-second"},
-        set(),
-    )
-
-    assert running == [
-        ready_first,
-        waiting_for_input,
-        restored_running,
-        ready_second,
+    # Exercise the former 128-entry boundary without overriding queue policy.
+    # Only the clock is fixed, to distinguish new waits from existing waits.
+    monkeypatch.setattr(coord_mod.time, "monotonic", lambda: 100.0)
+    statuses = [
+        RequestStatus.RUNNING,  # newly parked
+        RequestStatus.RUNNING,  # ready
+        RequestStatus.WAITING_FOR_INPUT,  # owned by the input coordinator
+        RequestStatus.WAITING_FOR_CHUNK,  # already parked
+        RequestStatus.WAITING_FOR_CHUNK,  # restored by a ready chunk
+        RequestStatus.RUNNING,  # parked with an existing timeout timestamp
     ]
-    assert list(coord._waiting_for_chunk_running) == [moved_first, moved_second]
+    requests = [_make_request(f"request-{i}", status=statuses[i % 6]) for i in range(queue_size)]
+    groups = [requests[offset::6] for offset in range(6)]
+    for request in requests:
+        request.external_req_id = f"external-{request.request_id}"
+    for request in groups[2] + groups[3] + groups[4] + groups[5]:
+        coord._waiting_since[request.request_id] = 90.0
+    ready_ids = {request.request_id for request in groups[1] + groups[4]}
+    running = CountingList(requests)
+    running_alias = running
+    waiting = MockQueue()
+
+    coord.process_pending_chunks(waiting, running, ready_ids, set())
+
+    retained = [request for i, request in enumerate(requests) if i % 6 in (1, 2, 4)]
+    parked = [request for i, request in enumerate(requests) if i % 6 in (0, 3, 5)]
+    newly_registered = [request for i, request in enumerate(requests) if i % 6 in (0, 5)]
+    assert running is running_alias
+    assert running == retained
+    assert list(coord._waiting_for_chunk_running) == parked
+    assert list(waiting) == []
     assert running.remove_calls == 0
-    assert [handle.request_id for handle in coord.pending_chunk_registrations] == [
-        "moved-first",
-        "moved-second",
+    assert [request.status for request in requests] == [
+        RequestStatus.WAITING_FOR_INPUT
+        if i % 6 == 2
+        else RequestStatus.RUNNING
+        if i % 6 in (1, 4)
+        else RequestStatus.WAITING_FOR_CHUNK
+        for i in range(queue_size)
     ]
+    assert [(handle.request_id, handle.external_req_id) for handle in coord.pending_chunk_registrations] == [
+        (request.request_id, request.external_req_id) for request in newly_registered
+    ]
+    assert coord.requests_with_ready_chunks == ready_ids
+    assert coord._waiting_since == {
+        request.request_id: 100.0 if i % 6 == 0 else 90.0 for i, request in enumerate(requests) if i % 6 in (0, 2, 3, 5)
+    }
 
 
 class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
